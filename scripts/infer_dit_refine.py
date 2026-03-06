@@ -53,7 +53,11 @@ def load_models(config_path, ckpt_path, device='cuda', args=None):
     vae = instantiate_from_config(config.model.params.vae_config)
     
     print("Instantiating DiT...")
-    dit = instantiate_from_config(config.model.params.dit_cfg)
+    if args and args.gguf:
+        with torch.device("meta"):
+            dit = instantiate_from_config(config.model.params.dit_cfg)
+    else:
+        dit = instantiate_from_config(config.model.params.dit_cfg)
     
     print("Instantiating Conditioner...")
     conditioner = instantiate_from_config(config.model.params.conditioner_config)
@@ -62,6 +66,21 @@ def load_models(config_path, ckpt_path, device='cuda', args=None):
     scheduler = instantiate_from_config(config.model.params.scheduler_cfg)
     image_processor = instantiate_from_config(config.model.params.image_processor_cfg)
     
+    def is_meta(m):
+        return any(p.is_meta for p in m.parameters())
+
+    if is_meta(vae):
+        vae.to_empty(device=device)
+    else:
+        vae.to(device)
+        
+    if is_meta(dit):
+        dit.to_empty(device=device)
+    else:
+        dit.to(device)
+        
+    conditioner.to(device)
+
     weights = None
     if ckpt_path and os.path.exists(ckpt_path):
         print(f"Loading weights from {ckpt_path}...")
@@ -96,9 +115,13 @@ def load_models(config_path, ckpt_path, device='cuda', args=None):
     else:
         print("Warning: No DiT weights found/provided.")
     
-    vae.eval().to(device)
-    dit.eval().to(device)
-    conditioner.eval().to(device)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    vae.eval()
+    dit.eval()
+    conditioner.eval()
     
     if hasattr(vae, 'enable_flashvdm_decoder'):
         vae.enable_flashvdm_decoder()

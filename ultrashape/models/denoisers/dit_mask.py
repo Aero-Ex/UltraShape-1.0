@@ -101,7 +101,12 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t, condition):
 
-        t_freq = self.time_embed(t).type(self.mlp[0].weight.dtype)
+        weight_dtype = self.mlp[0].weight.dtype
+        # Avoid uint8 (can happen with some quantization schemes)
+        if weight_dtype == torch.uint8:
+            weight_dtype = torch.float16 if t.device.type == 'cuda' else torch.float32
+        # Always cast to float32 first then to target to avoid silent precision errors
+        t_freq = self.time_embed(t).to(weight_dtype)
 
         # t_freq = timestep_embedding(t, self.frequency_embedding_size).type(self.mlp[0].weight.dtype)
         if condition is not None:
@@ -211,7 +216,7 @@ class CrossAttention(nn.Module):
             cu_seqlens_q = torch.arange(0, (b + 1) * s1, s1, dtype=torch.int32, device=x.device)
             cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, device=x.device)
             
-            # Call flash attention varlen
+            # Call flash attention varlen - flash_attn requires bf16 or fp16
             q_flat = q_flat.to(torch.bfloat16)
             k_flat = k_flat.to(torch.bfloat16)
             v_flat = v_flat.to(torch.bfloat16)

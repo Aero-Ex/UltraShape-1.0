@@ -387,6 +387,10 @@ class FlashVDMVolumeDecoding:
             torch.cuda.empty_cache()
 
             next_points = torch.stack(nidx, dim=1)
+            if next_points.shape[0] == 0:
+                logger.warning(f"No points found at resolution {octree_depth_now}. Terminating hierarchical decoding.")
+                break
+
             next_points = (next_points * torch.tensor(resolution, dtype=torch.float32, device=device) +
                            torch.tensor(bbox_min, dtype=torch.float32, device=device))
 

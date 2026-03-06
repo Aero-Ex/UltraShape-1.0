@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import pickle
-from ultrashape.utils.typing import *
+from ultrashape.utils.typing_types import *
 import pandas as pd
 import cv2
 import torchvision.transforms as transforms

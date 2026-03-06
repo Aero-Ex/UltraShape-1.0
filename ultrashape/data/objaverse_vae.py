@@ -40,7 +40,7 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as transforms
 from pytorch_lightning.utilities import rank_zero_info
-from ultrashape.utils.typing import *
+from ultrashape.utils.typing_types import *
 
 class ObjaverseDataset(Dataset):
     def __init__(

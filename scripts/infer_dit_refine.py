@@ -1,30 +1,70 @@
 import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import argparse
 import torch
+import warnings
+# Suppress the noisy RequestsDependencyWarning from the environment
+try:
+    from requests.exceptions import RequestsDependencyWarning
+    warnings.filterwarnings('ignore', category=RequestsDependencyWarning)
+except ImportError:
+    pass
 import numpy as np
+import gc
 from PIL import Image
 from omegaconf import OmegaConf
 
-# project_root = '[your_project_root_path]'  # Replace with your project root path
-# sys.path.insert(0, project_root)
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from ultrashape.rembg import BackgroundRemover
 from ultrashape.utils.misc import instantiate_from_config
 from ultrashape.surface_loaders import SharpEdgeSurfaceLoader
 from ultrashape.utils import voxelize_from_point
 from ultrashape.pipelines import UltraShapePipeline 
+from ultrashape.utils.gguf_loader import patch_model, load_gguf
 
-def load_models(config_path, ckpt_path, device='cuda'):
+def sequential_load_safetensors(model, path, device='cpu'):
+    from safetensors import safe_open
+    print(f"Sequentially loading {path} to {device}...")
+    model_keys = set(model.state_dict().keys())
+    with safe_open(path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if key in model_keys:
+                obj = model
+                parts = key.split(".")
+                for part in parts[:-1]:
+                    obj = getattr(obj, part)
+                param = getattr(obj, parts[-1])
+                
+                with torch.no_grad():
+                    param.data.copy_(f.get_tensor(key).to(device))
+            else:
+                print(f"Skipping {key}")
 
+def load_models(config_path, ckpt_path, device='cuda', args=None):
+    
+    # Determine loading device
+    load_device = 'cpu' if args and args.offload else device
+    
     print(f"Loading config from {config_path}...")
     config = OmegaConf.load(config_path)
     
     print("Instantiating VAE...")
-    vae = instantiate_from_config(config.model.params.vae_config)
+    if args and args.offload:
+        with torch.device("meta"):
+            vae = instantiate_from_config(config.model.params.vae_config)
+    else:
+        vae = instantiate_from_config(config.model.params.vae_config)
     
     print("Instantiating DiT...")
-    dit = instantiate_from_config(config.model.params.dit_cfg)
+    if args and args.gguf:
+        with torch.device("meta"):
+            dit = instantiate_from_config(config.model.params.dit_cfg)
+    else:
+        dit = instantiate_from_config(config.model.params.dit_cfg)
     
     print("Instantiating Conditioner...")
     conditioner = instantiate_from_config(config.model.params.conditioner_config)
@@ -33,16 +73,67 @@ def load_models(config_path, ckpt_path, device='cuda'):
     scheduler = instantiate_from_config(config.model.params.scheduler_cfg)
     image_processor = instantiate_from_config(config.model.params.image_processor_cfg)
     
-    print(f"Loading weights from {ckpt_path}...")
-    weights = torch.load(ckpt_path, map_location='cpu')
+    def is_meta(m):
+        return any(p.is_meta for p in m.parameters())
+
+    if is_meta(vae):
+        vae.to_empty(device=load_device)
+    else:
+        vae.to(load_device)
+        
+    if is_meta(dit):
+        dit.to_empty(device=load_device)
+    else:
+        dit.to(load_device)
+        
+    # Conditioner is never meta-inited in current logic to avoid transformers error
+    conditioner.to(load_device)
+
+    weights = None
+    if ckpt_path and os.path.exists(ckpt_path):
+        print(f"Loading weights from {ckpt_path}...")
+        weights = torch.load(ckpt_path, map_location='cpu')
     
-    vae.load_state_dict(weights['vae'], strict=True)
-    dit.load_state_dict(weights['dit'], strict=True)
-    conditioner.load_state_dict(weights['conditioner'], strict=True)
+    # Load VAE
+    if args and args.vae and os.path.exists(args.vae):
+        sequential_load_safetensors(vae, args.vae, device=load_device)
+    elif weights and 'vae' in weights:
+        vae.load_state_dict(weights['vae'], strict=True)
+        vae.to(load_device)
+        del weights['vae'] # Free memory early
+    else:
+        print("Warning: No VAE weights found/provided.")
+
+    # Load Conditioner
+    if args and args.conditioner and os.path.exists(args.conditioner):
+        sequential_load_safetensors(conditioner, args.conditioner, device=load_device)
+    elif weights and 'conditioner' in weights:
+        conditioner.load_state_dict(weights['conditioner'], strict=True)
+        conditioner.to(load_device)
+        del weights['conditioner'] # Free memory early
+    else:
+        print("Warning: No Conditioner weights found/provided.")
+
+    # Load DiT (GGUF or PT)
+    if args and args.gguf:
+        print(f"Patching DiT and loading GGUF weights from {args.gguf}...")
+        patch_model(dit)
+        # load_gguf is already sequential (parameter by parameter)
+        load_gguf(args.gguf, dit, device=load_device)
+    elif weights and 'dit' in weights:
+        dit.load_state_dict(weights['dit'], strict=True)
+        dit.to(load_device)
+        del weights['dit']
+    else:
+        print("Warning: No DiT weights found/provided.")
     
-    vae.eval().to(device)
-    dit.eval().to(device)
-    conditioner.eval().to(device)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    vae.eval()
+    dit.eval()
+    conditioner.eval()
     
     if hasattr(vae, 'enable_flashvdm_decoder'):
         vae.enable_flashvdm_decoder()
@@ -60,18 +151,25 @@ def load_models(config_path, ckpt_path, device='cuda'):
 def run_inference(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    components, config = load_models(args.config, args.ckpt, device)
+    components, config = load_models(args.config, args.ckpt, device, args)
+    
+    # If offloading, instantiate the pipeline on CPU first to avoid VRAM spike
+    pipeline_device = "cpu" if args.offload else device
     
     pipeline = UltraShapePipeline(
         vae=components['vae'],
         model=components['dit'],
         scheduler=components['scheduler'],
         conditioner=components['conditioner'],
-        image_processor=components['image_processor']
+        image_processor=components['image_processor'],
+        device=pipeline_device,
+        dtype=torch.bfloat16
     )
 
-    if args.low_vram:
-        pipeline.enable_model_cpu_offload()
+    if args.offload:
+        print("Enabling model CPU offloading...")
+        pipeline.enable_model_cpu_offload(device=device)
+        pipeline.device = device
 
     token_num = args.num_latents
     voxel_res = config.model.params.vae_config.params.voxel_query_res
@@ -89,15 +187,27 @@ def run_inference(args):
         rembg = BackgroundRemover()
         image = rembg(image)
     
-    surface = loader(args.mesh, normalize_scale=args.scale).to(device, dtype=torch.float16)
+    surface = loader(args.mesh, normalize_scale=args.scale).to(device, dtype=torch.bfloat16)
     pc = surface[:, :, :3] # [B, N, 3]
     
     # Voxelize
     _, voxel_idx = voxelize_from_point(pc, token_num, resolution=voxel_res)
     
     print("Running diffusion process...")
-    generator = torch.Generator(device).manual_seed(args.seed)
+    gen_device = "cpu" if args.offload else device
+    generator = torch.Generator(gen_device).manual_seed(args.seed)
     
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
+    print("Starting VAE decoding & mesh generation...")
+    # Offload verification audit
+    if args.offload:
+        def get_dev(m): return next(m.parameters()).device.type
+        print(f"DEBUG: VAE device: {get_dev(pipeline.vae)}, DiT device: {get_dev(pipeline.model)}, Cond device: {get_dev(pipeline.conditioner)}")
+
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         mesh, _ = pipeline(
             image=image,
@@ -121,8 +231,12 @@ def run_inference(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="UltraShape Inference Script")
     
-    parser.add_argument("--config", type=str, default="configs/infer_dit2.yaml", help="Path to inference config")
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to split checkpoint (.pt)")
+    parser.add_argument("--config", type=str, default="configs/infer_dit_refine.yaml", help="Path to inference config")
+    parser.add_argument("--ckpt", type=str, default=None, help="Path to split checkpoint (.pt) (optional if GGUF/VAE/Cond paths provided)")
+    parser.add_argument("--gguf", type=str, default=None, help="Path to GGUF model (replaces DiT in .pt)")
+    parser.add_argument("--vae", type=str, default=None, help="Path to VAE .safetensors (replaces VAE in .pt)")
+    parser.add_argument("--conditioner", type=str, default=None, help="Path to Conditioner .safetensors (replaces Conditioner in .pt)")
+    parser.add_argument("--offload", action="store_true", help="Enable sequential model offloading (CPU <-> GPU)")
     parser.add_argument("--low_vram", action="store_true", help="Optimize for low VRAM usage")
     
     parser.add_argument("--image", type=str, required=True, help="Input image path")

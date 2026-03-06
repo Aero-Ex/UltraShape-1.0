@@ -36,7 +36,7 @@ from tqdm import tqdm
 
 from .models.autoencoders import ShapeVAE
 from .models.autoencoders import SurfaceExtractors
-from .utils import logger, synchronize_timer, smart_load_model
+from .utils import logger, synchronize_timer, smart_load_model, log_vram
 
 
 def retrieve_timesteps(
@@ -581,7 +581,7 @@ class DiTPipeline:
 
         self.set_surface_extractor(mc_algo)
 
-        device = self.device
+        device = self._execution_device
         dtype = self.dtype
         do_classifier_free_guidance = guidance_scale >= 0 and \
                                       getattr(self.model, 'guidance_cond_proj_dim', None) is None
@@ -667,9 +667,17 @@ class DiTPipeline:
         mc_algo='mc',
         enable_pbar=True
     ):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        log_vram("Export Start")
+
         if not output_type == "latent":
             latents = 1. / self.vae.scale_factor * latents
+            log_vram("Before VAE Forward")
             latents = self.vae(latents)
+            log_vram("After VAE Forward")
+
+            print(f"Starting latents2mesh (Chunks: {num_chunks})...")
             outputs, _ = self.vae.latents2mesh(
                 latents,
                 bounds=box_v,
@@ -679,11 +687,17 @@ class DiTPipeline:
                 mc_algo=mc_algo,
                 enable_pbar=enable_pbar,
             )
+            log_vram("After latents2mesh")
         else:
             outputs = latents
 
         if output_type == 'trimesh':
             outputs = export_to_trimesh(outputs)
+            log_vram("After Export")
+
+        if torch.cuda.is_available():
+            peak = torch.cuda.max_memory_allocated() / 1024**2
+            print(f"[VAE Trace] Lifecycle Peak VRAM: {peak:.2f}MB")
 
         return outputs
 
@@ -715,8 +729,8 @@ class UltraShapePipeline(DiTPipeline):
         callback_steps = kwargs.pop("callback_steps", None)
 
         self.set_surface_extractor(mc_algo)
-
-        device = self.device
+ 
+        device = self._execution_device
         dtype = self.dtype
         do_classifier_free_guidance = guidance_scale >= 0 and not (
             hasattr(self.model, 'guidance_embed') and

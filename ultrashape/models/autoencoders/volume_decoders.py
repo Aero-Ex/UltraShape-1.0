@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 from .attention_blocks import CrossAttentionDecoder
 from .attention_processors import FlashVDMCrossAttentionProcessor, FlashVDMTopMCrossAttentionProcessor
-from ...utils import logger
+from ...utils import logger, log_vram
 
 
 def extract_near_surface_volume_fn(input_tensor: torch.Tensor, alpha: float):
@@ -136,6 +136,7 @@ class VanillaVolumeDecoder:
             octree_resolution=octree_resolution,
             indexing="ij"
         )
+        log_vram(f"Dec: Start (Res: {octree_resolution})")
         xyz_samples = torch.from_numpy(xyz_samples).to(device, dtype=dtype).contiguous().reshape(-1, 3)
 
         # 2. latents to 3d volume
@@ -144,7 +145,9 @@ class VanillaVolumeDecoder:
                           disable=not enable_pbar):
             chunk_queries = xyz_samples[start: start + num_chunks, :]
             chunk_queries = repeat(chunk_queries, "p c -> b p c", b=batch_size)
+            log_vram("Dec: Before Geo Query")
             logits = geo_decoder(queries=chunk_queries, latents=latents)
+            log_vram("Dec: After Geo Query")
             batch_logits.append(logits)
 
         grid_logits = torch.cat(batch_logits, dim=1)
@@ -205,7 +208,9 @@ class HierarchicalVolumeDecoding:
                           desc=f"Hierarchical Volume Decoding [r{resolutions[0] + 1}]"):
             queries = xyz_samples[start: start + num_chunks, :]
             batch_queries = repeat(queries, "p c -> b p c", b=batch_size)
+            log_vram("Dec: Before Geo Query (Hier)")
             logits = geo_decoder(queries=batch_queries, latents=latents)
+            log_vram("Dec: After Geo Query (Hier)")
             batch_logits.append(logits)
 
         grid_logits = torch.cat(batch_logits, dim=1).view((batch_size, grid_size[0], grid_size[1], grid_size[2]))
@@ -243,7 +248,9 @@ class HierarchicalVolumeDecoding:
                               desc=f"Hierarchical Volume Decoding [r{octree_depth_now + 1}]"):
                 queries = next_points[start: start + num_chunks, :]
                 batch_queries = repeat(queries, "p c -> b p c", b=batch_size)
+                log_vram("Dec: Before Geo Query (Hier Loop)")
                 logits = geo_decoder(queries=batch_queries.to(latents.dtype), latents=latents)
+                log_vram("Dec: After Geo Query (Hier Loop)")
                 batch_logits.append(logits)
 
             # Delayed allocation of next_logits
@@ -291,6 +298,7 @@ class FlashVDMVolumeDecoding:
             resolutions.append(octree_resolution)
         while octree_resolution >= min_resolution:
             resolutions.append(octree_resolution)
+            log_vram(f"Dec: Start (Res: {octree_resolution})")
             octree_resolution = octree_resolution // 2
         resolutions.reverse()
         resolutions[0] = round(resolutions[0] / mini_grid_num) * mini_grid_num - 1
@@ -345,11 +353,15 @@ class FlashVDMVolumeDecoding:
                 batch_logits_sub = []
                 for sub_start in range(0, queries.shape[1], num_chunks):
                     sub_queries = queries[:, sub_start: sub_start + num_chunks, :]
+                    log_vram("Dec: Before Geo Query")
                     logits = geo_decoder(queries=sub_queries, latents=batch_latents)
+                    log_vram("Dec: After Geo Query")
                     batch_logits_sub.append(logits)
                 logits = torch.cat(batch_logits_sub, dim=1)
             else:
+                log_vram("Dec: Before Geo Query")
                 logits = geo_decoder(queries=queries, latents=batch_latents)
+                log_vram("Dec: After Geo Query")
 
             batch_logits.append(logits)
         grid_logits = torch.cat(batch_logits, dim=0).reshape(
@@ -429,7 +441,9 @@ class FlashVDMVolumeDecoding:
                     remaining_count -= take
             if sum_num > 0:
                 processor.topk = input_grid
+                log_vram(f"FlashVDM: Geo Query (Hier Res: {octree_depth_now})")
                 logits_grid = geo_decoder(queries=next_points[:, start_num:start_num + sum_num], latents=latents)
+                log_vram("FlashVDM: After Geo Query")
                 logits_grid_list.append(logits_grid)
             logits_grid = torch.cat(logits_grid_list, dim=1)
             grid_logits[index.indices] = logits_grid.squeeze(0).squeeze(-1)

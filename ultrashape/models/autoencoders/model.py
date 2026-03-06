@@ -40,7 +40,7 @@ import yaml
 from .attention_blocks import FourierEmbedder, Transformer, CrossAttentionDecoder, PointCrossAttentionEncoder
 from .surface_extractors import MCSurfaceExtractor, SurfaceExtractors
 from .volume_decoders import VanillaVolumeDecoder, FlashVDMVolumeDecoding, HierarchicalVolumeDecoding
-from ...utils import logger, synchronize_timer, smart_load_model
+from ...utils import logger, synchronize_timer, smart_load_model, log_vram
 
 
 class DiagonalGaussianDistribution(object):
@@ -220,10 +220,13 @@ class VectsetVAE(nn.Module):
         self.surface_extractor = surface_extractor
 
     def latents2mesh(self, latents: torch.FloatTensor, **kwargs):
+        log_vram("VAE: Start latents2mesh")
         with synchronize_timer('Volume decoding'):
             grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
+        log_vram("VAE: After Volume decoding")
         with synchronize_timer('Surface extraction'):
             outputs = self.surface_extractor(grid_logits, **kwargs)
+        log_vram("VAE: After Surface extraction")
         return outputs, grid_logits
 
     def enable_flashvdm_decoder(
@@ -338,8 +341,11 @@ class ShapeVAE(VectsetVAE):
             self.enable_flashvdm_decoder()
 
     def forward(self, latents):
+        log_vram("VAE: Start Forward")
         latents = self.post_kl(latents)
+        log_vram("VAE: After post_kl")
         latents = self.transformer(latents)
+        log_vram("VAE: After transformer")
         return latents
 
     def encode(self, surface, sample_posterior=True, need_kl=False, need_voxel=False):

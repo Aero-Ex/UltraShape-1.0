@@ -35,6 +35,11 @@ def get_logger(name):
 logger = get_logger('hy3dgen.shapgen')
 
 
+def log_vram(tag):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**2
+        reserved = torch.cuda.memory_reserved() / 1024**2
+        print(f"[VAE Trace] {tag: <20} | Allocated: {allocated: >8.2f}MB | Reserved: {reserved: >8.2f}MB")
 class synchronize_timer:
     """ Synchronized timer to count the inference time of `nn.Module.forward`.
 

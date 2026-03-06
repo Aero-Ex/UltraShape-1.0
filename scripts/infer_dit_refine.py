@@ -46,25 +46,14 @@ def sequential_load_safetensors(model, path, device='cpu'):
 
 def load_models(config_path, ckpt_path, device='cuda', args=None):
     
-    # Determine loading device
-    load_device = 'cpu' if args and args.offload else device
-    
     print(f"Loading config from {config_path}...")
     config = OmegaConf.load(config_path)
     
     print("Instantiating VAE...")
-    if args and args.offload:
-        with torch.device("meta"):
-            vae = instantiate_from_config(config.model.params.vae_config)
-    else:
-        vae = instantiate_from_config(config.model.params.vae_config)
+    vae = instantiate_from_config(config.model.params.vae_config)
     
     print("Instantiating DiT...")
-    if args and args.gguf:
-        with torch.device("meta"):
-            dit = instantiate_from_config(config.model.params.dit_cfg)
-    else:
-        dit = instantiate_from_config(config.model.params.dit_cfg)
+    dit = instantiate_from_config(config.model.params.dit_cfg)
     
     print("Instantiating Conditioner...")
     conditioner = instantiate_from_config(config.model.params.conditioner_config)
@@ -73,22 +62,6 @@ def load_models(config_path, ckpt_path, device='cuda', args=None):
     scheduler = instantiate_from_config(config.model.params.scheduler_cfg)
     image_processor = instantiate_from_config(config.model.params.image_processor_cfg)
     
-    def is_meta(m):
-        return any(p.is_meta for p in m.parameters())
-
-    if is_meta(vae):
-        vae.to_empty(device=load_device)
-    else:
-        vae.to(load_device)
-        
-    if is_meta(dit):
-        dit.to_empty(device=load_device)
-    else:
-        dit.to(load_device)
-        
-    # Conditioner is never meta-inited in current logic to avoid transformers error
-    conditioner.to(load_device)
-
     weights = None
     if ckpt_path and os.path.exists(ckpt_path):
         print(f"Loading weights from {ckpt_path}...")
@@ -96,20 +69,18 @@ def load_models(config_path, ckpt_path, device='cuda', args=None):
     
     # Load VAE
     if args and args.vae and os.path.exists(args.vae):
-        sequential_load_safetensors(vae, args.vae, device=load_device)
+        sequential_load_safetensors(vae, args.vae, device=device)
     elif weights and 'vae' in weights:
         vae.load_state_dict(weights['vae'], strict=True)
-        vae.to(load_device)
         del weights['vae'] # Free memory early
     else:
         print("Warning: No VAE weights found/provided.")
 
     # Load Conditioner
     if args and args.conditioner and os.path.exists(args.conditioner):
-        sequential_load_safetensors(conditioner, args.conditioner, device=load_device)
+        sequential_load_safetensors(conditioner, args.conditioner, device=device)
     elif weights and 'conditioner' in weights:
         conditioner.load_state_dict(weights['conditioner'], strict=True)
-        conditioner.to(load_device)
         del weights['conditioner'] # Free memory early
     else:
         print("Warning: No Conditioner weights found/provided.")
@@ -118,22 +89,16 @@ def load_models(config_path, ckpt_path, device='cuda', args=None):
     if args and args.gguf:
         print(f"Patching DiT and loading GGUF weights from {args.gguf}...")
         patch_model(dit)
-        # load_gguf is already sequential (parameter by parameter)
-        load_gguf(args.gguf, dit, device=load_device)
+        load_gguf(args.gguf, dit, device=device)
     elif weights and 'dit' in weights:
         dit.load_state_dict(weights['dit'], strict=True)
-        dit.to(load_device)
         del weights['dit']
     else:
         print("Warning: No DiT weights found/provided.")
     
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    vae.eval()
-    dit.eval()
-    conditioner.eval()
+    vae.eval().to(device)
+    dit.eval().to(device)
+    conditioner.eval().to(device)
     
     if hasattr(vae, 'enable_flashvdm_decoder'):
         vae.enable_flashvdm_decoder()
@@ -153,23 +118,17 @@ def run_inference(args):
 
     components, config = load_models(args.config, args.ckpt, device, args)
     
-    # If offloading, instantiate the pipeline on CPU first to avoid VRAM spike
-    pipeline_device = "cpu" if args.offload else device
-    
     pipeline = UltraShapePipeline(
         vae=components['vae'],
         model=components['dit'],
         scheduler=components['scheduler'],
         conditioner=components['conditioner'],
-        image_processor=components['image_processor'],
-        device=pipeline_device,
-        dtype=torch.bfloat16
+        image_processor=components['image_processor']
     )
 
-    if args.offload:
-        print("Enabling model CPU offloading...")
-        pipeline.enable_model_cpu_offload(device=device)
-        pipeline.device = device
+    if args.low_vram:
+        print("Enabling official model CPU offloading...")
+        pipeline.enable_model_cpu_offload()
 
     token_num = args.num_latents
     voxel_res = config.model.params.vae_config.params.voxel_query_res
@@ -194,20 +153,8 @@ def run_inference(args):
     _, voxel_idx = voxelize_from_point(pc, token_num, resolution=voxel_res)
     
     print("Running diffusion process...")
-    gen_device = "cpu" if args.offload else device
-    generator = torch.Generator(gen_device).manual_seed(args.seed)
+    generator = torch.Generator(device).manual_seed(args.seed)
     
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        
-    print("Starting VAE decoding & mesh generation...")
-    # Offload verification audit
-    if args.offload:
-        def get_dev(m): return next(m.parameters()).device.type
-        print(f"DEBUG: VAE device: {get_dev(pipeline.vae)}, DiT device: {get_dev(pipeline.model)}, Cond device: {get_dev(pipeline.conditioner)}")
-
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         mesh, _ = pipeline(
             image=image,
@@ -236,7 +183,6 @@ if __name__ == "__main__":
     parser.add_argument("--gguf", type=str, default=None, help="Path to GGUF model (replaces DiT in .pt)")
     parser.add_argument("--vae", type=str, default=None, help="Path to VAE .safetensors (replaces VAE in .pt)")
     parser.add_argument("--conditioner", type=str, default=None, help="Path to Conditioner .safetensors (replaces Conditioner in .pt)")
-    parser.add_argument("--offload", action="store_true", help="Enable sequential model offloading (CPU <-> GPU)")
     parser.add_argument("--low_vram", action="store_true", help="Optimize for low VRAM usage")
     
     parser.add_argument("--image", type=str, required=True, help="Input image path")

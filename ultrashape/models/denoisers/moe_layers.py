@@ -28,6 +28,9 @@ class AddAuxiliaryLoss(torch.autograd.Function):
     """
     @staticmethod
     def forward(ctx, x, loss):
+        if loss is None:
+            ctx.required_aux_loss = False
+            return x
         assert loss.numel() == 1
         ctx.dtype = loss.dtype
         ctx.required_aux_loss = loss.requires_grad
@@ -146,7 +149,8 @@ class MoEBlock(nn.Module):
                 y[flat_topk_idx == i] = tmp.to(hidden_states.dtype)
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y =  y.view(*orig_shape)
-            y = AddAuxiliaryLoss.apply(y, aux_loss)
+            if aux_loss is not None:
+                y = AddAuxiliaryLoss.apply(y, aux_loss)
         else:
             y = self.moe_infer(hidden_states, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
         y = y + self.shared_experts(identity)

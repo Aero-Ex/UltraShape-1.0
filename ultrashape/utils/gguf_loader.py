@@ -466,8 +466,14 @@ def load_gguf(path, model, device="cpu"):
         else:
             if param.device.type == 'meta':
                 # Materialize missing parameters (biases, norms) on target device
+                print(f"Materializing {name} on {device}...")
                 with torch.no_grad():
-                    new_data = torch.zeros_like(param, device=device, dtype=param.dtype)
+                    # For weights/norms, we usually want ones (identity/no scale) 
+                    # For biases, we want zeros.
+                    if 'weight' in name and ('.norm' in name or 'norm.' in name or '.ln' in name):
+                        new_data = torch.ones_like(param, device=device, dtype=param.dtype)
+                    else:
+                        new_data = torch.zeros_like(param, device=device, dtype=param.dtype)
                     new_param = torch.nn.Parameter(new_data, requires_grad=param.requires_grad)
                     rsetattr(model, name, new_param)
             elif device != param.device:

@@ -29,79 +29,106 @@ from ultrashape.utils.gguf_loader import patch_model, load_gguf
 def sequential_load_safetensors(model, path, device='cpu'):
     from safetensors import safe_open
     print(f"Sequentially loading {path} to {device}...")
-    model_keys = set(model.state_dict().keys())
+    
+    # Use named_parameters and named_buffers to avoid state_dict() overhead
+    weight_map = {k: v for k, v in model.named_parameters()}
+    weight_map.update({k: v for k, v in model.named_buffers()})
+    
     with safe_open(path, framework="pt", device="cpu") as f:
         for key in f.keys():
-            if key in model_keys:
-                obj = model
-                parts = key.split(".")
-                for part in parts[:-1]:
-                    obj = getattr(obj, part)
-                param = getattr(obj, parts[-1])
-                
+            if key in weight_map:
+                param = weight_map[key]
                 with torch.no_grad():
                     param.data.copy_(f.get_tensor(key).to(device))
             else:
-                print(f"Skipping {key}")
+                # Some keys might be prefixed, handle potential common prefixes
+                print(f"Skipping {key} (not in model)")
+    del weight_map
+    gc.collect()
 
 def load_models(config_path, ckpt_path, device='cuda', args=None):
-    
     print(f"Loading config from {config_path}...")
     config = OmegaConf.load(config_path)
     
-    print("Instantiating VAE...")
-    vae = instantiate_from_config(config.model.params.vae_config)
-    
-    print("Instantiating DiT...")
-    dit = instantiate_from_config(config.model.params.dit_cfg)
-    
-    print("Instantiating Conditioner...")
-    conditioner = instantiate_from_config(config.model.params.conditioner_config)
-    
-    print("Instantiating Scheduler & Processor...")
-    scheduler = instantiate_from_config(config.model.params.scheduler_cfg)
-    image_processor = instantiate_from_config(config.model.params.image_processor_cfg)
-    
     weights = None
     if ckpt_path and os.path.exists(ckpt_path):
-        print(f"Loading weights from {ckpt_path}...")
-        weights = torch.load(ckpt_path, map_location='cpu')
-    
-    # Load VAE
+        print(f"Loading weights from {ckpt_path} to CPU (mmap=True)...")
+        try:
+            # Use mmap=True to avoid loading everything into RAM at once
+            weights = torch.load(ckpt_path, map_location='cpu', mmap=True, weights_only=True)
+        except Exception as e:
+            print(f"Standard mmap load failed ({e}), trying without weights_only...")
+            try:
+                weights = torch.load(ckpt_path, map_location='cpu', mmap=True)
+            except Exception as e2:
+                print(f"mmap load failed ({e2}), falling back to direct load...")
+                weights = torch.load(ckpt_path, map_location='cpu')
+
+    def cleanup():
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # 1. Sequential VAE
+    print("Instantiating VAE...")
+    vae = instantiate_from_config(config.model.params.vae_config)
     if args and args.vae and os.path.exists(args.vae):
         sequential_load_safetensors(vae, args.vae, device=device)
     elif weights and 'vae' in weights:
         vae.load_state_dict(weights['vae'], strict=True)
-        del weights['vae'] # Free memory early
+        del weights['vae']
     else:
         print("Warning: No VAE weights found/provided.")
+    
+    vae.eval().to(device)
+    if hasattr(vae, 'enable_flashvdm_decoder'):
+        vae.enable_flashvdm_decoder()
+    cleanup()
 
-    # Load Conditioner
+    # 2. Sequential Conditioner
+    print("Instantiating Conditioner...")
+    conditioner = instantiate_from_config(config.model.params.conditioner_config)
     if args and args.conditioner and os.path.exists(args.conditioner):
         sequential_load_safetensors(conditioner, args.conditioner, device=device)
     elif weights and 'conditioner' in weights:
         conditioner.load_state_dict(weights['conditioner'], strict=True)
-        del weights['conditioner'] # Free memory early
+        del weights['conditioner']
     else:
         print("Warning: No Conditioner weights found/provided.")
+    
+    conditioner.eval().to(device)
+    cleanup()
 
-    # Load DiT (GGUF or PT)
+    # 3. Sequential DiT
+    print("Instantiating DiT...")
     if args and args.gguf:
+        # Use meta device to avoid ~6GB CPU RAM spike
+        with torch.device("meta"):
+            dit = instantiate_from_config(config.model.params.dit_cfg)
         print(f"Patching DiT and loading GGUF weights from {args.gguf}...")
         patch_model(dit)
         load_gguf(args.gguf, dit, device=device)
+        dit.eval().to(device)
     elif weights and 'dit' in weights:
+        dit = instantiate_from_config(config.model.params.dit_cfg)
         dit.load_state_dict(weights['dit'], strict=True)
         del weights['dit']
+        dit.eval().to(device)
     else:
+        dit = instantiate_from_config(config.model.params.dit_cfg)
         print("Warning: No DiT weights found/provided.")
+        dit.eval().to(device)
     
-    vae.eval().to(device)
-    dit.eval().to(device)
-    conditioner.eval().to(device)
+    cleanup()
+
+    # 4. Other components
+    print("Instantiating Scheduler & Processor...")
+    scheduler = instantiate_from_config(config.model.params.scheduler_cfg)
+    image_processor = instantiate_from_config(config.model.params.image_processor_cfg)
     
-    if hasattr(vae, 'enable_flashvdm_decoder'):
-        vae.enable_flashvdm_decoder()
+    if weights is not None:
+        del weights
+        cleanup()
 
     components = {
         "vae": vae,

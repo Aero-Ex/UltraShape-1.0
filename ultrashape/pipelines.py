@@ -723,6 +723,9 @@ class UltraShapePipeline(DiTPipeline):
         output_type: Optional[str] = "trimesh",
         enable_pbar=True,
         mask = None,
+        high_token_mode: bool = False,
+        moe_offload: bool = False,
+        sequential_cfg: bool = False,
         **kwargs,
     ) -> List[List[trimesh.Trimesh]]:
         callback = kwargs.pop("callback", None)
@@ -772,24 +775,56 @@ class UltraShapePipeline(DiTPipeline):
             self.model.guidance_embed is True:
             guidance = torch.tensor([guidance_scale] * batch_size, device=device, dtype=dtype)
             # logger.info(f'Using guidance embed with scale {guidance_scale}')
-        if do_classifier_free_guidance and voxel_cond is not None:
+        
+        if do_classifier_free_guidance and voxel_cond is not None and not sequential_cfg:
             voxel_cond = torch.cat([voxel_cond] * 2)
+            
         with synchronize_timer('Diffusion Sampling'):
             for i, t in enumerate(tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:")):
                 # expand the latents if we are doing classifier free guidance
-                if do_classifier_free_guidance:
+                if do_classifier_free_guidance and not sequential_cfg:
                     latent_model_input = torch.cat([latents] * 2)
                 else:
                     latent_model_input = latents
 
                 # NOTE: we assume model get timesteps ranged from 0 to 1
-                timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype).to(latent_model_input.device)
-                timestep = timestep / self.scheduler.config.num_train_timesteps
-                if voxel_cond is None:
-                    noise_pred = self.model(latent_model_input, timestep, cond, guidance=guidance)
+                if not sequential_cfg:
+                    timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype).to(latent_model_input.device)
+                    timestep = timestep / self.scheduler.config.num_train_timesteps
+                    
+                    model_kwargs = {
+                        "guidance": guidance,
+                        "high_token_mode": high_token_mode,
+                        "moe_offload": moe_offload
+                    }
+                    if voxel_cond is not None:
+                        model_kwargs["voxel_cond"] = voxel_cond
+                        
+                    noise_pred = self.model(latent_model_input, timestep, cond, **model_kwargs)
                 else:
-                    noise_pred = self.model(latent_model_input, timestep, cond, 
-                            guidance=guidance, voxel_cond=voxel_cond)
+                    # Sequential CFG: process cond and uncond separately to save memory
+                    noise_preds = []
+                    for j in range(2):
+                        # j=0: conditional, j=1: unconditional
+                        cur_cond = {k: v[j*batch_size:(j+1)*batch_size] if isinstance(v, torch.Tensor) else v 
+                                    for k, v in cond.items()}
+                        
+                        cur_timestep = t.expand(batch_size).to(latents.dtype).to(latents.device)
+                        cur_timestep = cur_timestep / self.scheduler.config.num_train_timesteps
+                        
+                        cur_model_kwargs = {
+                            "guidance": guidance,
+                            "high_token_mode": high_token_mode,
+                            "moe_offload": moe_offload
+                        }
+                        if voxel_cond is not None:
+                            # voxel_cond was NOT cat-doubled if sequential_cfg is True
+                            cur_model_kwargs["voxel_cond"] = voxel_cond
+                            
+                        noise_preds.append(self.model(latents, cur_timestep, cur_cond, **cur_model_kwargs))
+                    
+                    noise_pred_cond, noise_pred_uncond = noise_preds
+                    noise_pred = torch.cat([noise_pred_cond, noise_pred_uncond], dim=0)
 
                 if do_classifier_free_guidance:
                     noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)

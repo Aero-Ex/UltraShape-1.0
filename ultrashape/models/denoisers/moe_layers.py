@@ -134,7 +134,7 @@ class MoEBlock(nn.Module):
     def initialize_weight(self):
         pass
     
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, high_token_mode=False, moe_offload=False):
         identity = hidden_states
         orig_shape = hidden_states.shape
         topk_idx, topk_weight, aux_loss = self.gate(hidden_states) 
@@ -152,13 +152,13 @@ class MoEBlock(nn.Module):
             if aux_loss is not None:
                 y = AddAuxiliaryLoss.apply(y, aux_loss)
         else:
-            y = self.moe_infer(hidden_states, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+            y = self.moe_infer(hidden_states, flat_topk_idx, topk_weight.view(-1, 1), moe_offload=moe_offload).view(*orig_shape)
         y = y + self.shared_experts(identity)
         return y
     
 
     @torch.no_grad()
-    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights, moe_offload=False):
         expert_cache = torch.zeros_like(x) 
         idxs = flat_expert_indices.argsort()
         tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
@@ -167,7 +167,11 @@ class MoEBlock(nn.Module):
             start_idx = 0 if i == 0 else tokens_per_expert[i-1]
             if start_idx == end_idx:
                 continue
+            
             expert = self.experts[i]
+            if moe_offload:
+                expert.to(x.device)
+
             exp_token_idx = token_idxs[start_idx:end_idx]
             expert_tokens = x[exp_token_idx]
             expert_out = expert(expert_tokens)
@@ -178,4 +182,9 @@ class MoEBlock(nn.Module):
             expert_cache.scatter_reduce_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]),
                                          expert_out, 
                                          reduce='sum')
+            
+            if moe_offload:
+                expert.to('cpu')
+                torch.cuda.empty_cache()
+
         return expert_cache

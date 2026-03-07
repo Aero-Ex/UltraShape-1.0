@@ -159,7 +159,7 @@ class CrossAttention(nn.Module):
         self.out_proj = nn.Linear(qdim, qdim, bias=True)
 
 
-    def forward(self, x, y):
+    def forward(self, x, y, high_token_mode=False):
         """
         Parameters
         ----------
@@ -167,8 +167,6 @@ class CrossAttention(nn.Module):
             (batch, seqlen1, hidden_dim) (where hidden_dim = num heads * head dim)
         y: torch.Tensor
             (batch, seqlen2, hidden_dim2) - may contain padding (marked with -1)
-        freqs_cis_img: torch.Tensor
-            (batch, hidden_dim // 2), RoPE for image
         """
         b, s1, c = x.shape  # [b, s1, D]
 
@@ -178,9 +176,26 @@ class CrossAttention(nn.Module):
         has_padding = not y_mask.all()
 
         _, s2, c = y.shape  # [b, s2, 1024]
-        q = self.to_q(x)
-        k = self.to_k(y)
-        v = self.to_v(y)
+        
+        if high_token_mode:
+            # Chunked QKV projections to save VRAM spikes at 16k+
+            num_chunks = 4000
+            q_list = []
+            for i in range(0, s1, num_chunks):
+                q_list.append(self.to_q(x[:, i:i+num_chunks, :]))
+            q = torch.cat(q_list, dim=1)
+            
+            k_list, v_list = [], []
+            for i in range(0, s2, num_chunks):
+                chunk_y = y[:, i:i+num_chunks, :]
+                k_list.append(self.to_k(chunk_y))
+                v_list.append(self.to_v(chunk_y))
+            k = torch.cat(k_list, dim=1)
+            v = torch.cat(v_list, dim=1)
+        else:
+            q = self.to_q(x)
+            k = self.to_k(y)
+            v = self.to_v(y)
 
         kv = torch.cat((k, v), dim=-1)
         split_size = kv.shape[-1] // self.num_heads // 2
@@ -243,7 +258,14 @@ class CrossAttention(nn.Module):
                     q, k, v, attn_mask=attn_mask
                 ).transpose(1, 2).reshape(b, s1, -1)
 
-        out = self.out_proj(context)
+        if high_token_mode:
+            num_chunks = 4000
+            out_list = []
+            for i in range(0, s1, num_chunks):
+                out_list.append(self.out_proj(context[:, i:i+num_chunks, :]))
+            out = torch.cat(out_list, dim=1)
+        else:
+            out = self.out_proj(context)
 
         return out
 
@@ -278,12 +300,24 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(dim, dim)
 
     # def forward(self, x):
-    def forward(self, x, rotary_cos=None, rotary_sin=None):
+    def forward(self, x, rotary_cos=None, rotary_sin=None, high_token_mode=False):
         B, N, C = x.shape
 
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
+        if high_token_mode:
+            num_chunks = 4000
+            q_list, k_list, v_list = [], [], []
+            for i in range(0, N, num_chunks):
+                chunk_x = x[:, i:i+num_chunks, :]
+                q_list.append(self.to_q(chunk_x))
+                k_list.append(self.to_k(chunk_x))
+                v_list.append(self.to_v(chunk_x))
+            q = torch.cat(q_list, dim=1)
+            k = torch.cat(k_list, dim=1)
+            v = torch.cat(v_list, dim=1)
+        else:
+            q = self.to_q(x)
+            k = self.to_k(x)
+            v = self.to_v(x)
 
         qkv = torch.cat((q, k, v), dim=-1)
         split_size = qkv.shape[-1] // self.num_heads // 3
@@ -311,7 +345,14 @@ class Attention(nn.Module):
             x = F.scaled_dot_product_attention(q, k, v)
             x = x.transpose(1, 2).reshape(B, N, -1)
 
-        x = self.out_proj(x)
+        if high_token_mode:
+            num_chunks = 4000
+            out_list = []
+            for i in range(0, N, num_chunks):
+                out_list.append(self.out_proj(x[:, i:i+num_chunks, :]))
+            x = torch.cat(out_list, dim=1)
+        else:
+            x = self.out_proj(x)
         return x
 
 
@@ -382,32 +423,41 @@ class DiTBlock(nn.Module):
         else:
             self.mlp = MLP(width=hidden_size)
 
-    def forward(self, x, c=None, text_states=None, skip_value=None, rotary_cos=None, rotary_sin=None):
+    def forward(self, x, c=None, text_states=None, skip_value=None, rotary_cos=None, rotary_sin=None, 
+                    high_token_mode=False, moe_offload=False):
 
         if self.skip_linear is not None:
-            cat = torch.cat([skip_value, x], dim=-1)
+            if skip_value.device != x.device:
+                skip_gpu = skip_value.to(x.device)
+                cat = torch.cat([skip_gpu, x], dim=-1)
+            else:
+                cat = torch.cat([skip_value, x], dim=-1)
+            
             x = self.skip_linear(cat)
             x = self.skip_norm(x)
+            del cat
 
         # Self-Attention
         if self.timested_modulate:
             shift_msa = self.default_modulation(c).unsqueeze(dim=1)
-            x = x + shift_msa
+            x.add_(shift_msa)
 
-        attn_out = self.attn1(self.norm1(x), rotary_cos=rotary_cos, rotary_sin=rotary_sin)
-
-        x = x + attn_out
+        attn_out = self.attn1(self.norm1(x), rotary_cos=rotary_cos, rotary_sin=rotary_sin, high_token_mode=high_token_mode)
+        x.add_(attn_out)
 
         # Cross-Attention
-        x = x + self.attn2(self.norm2(x), text_states)
+        ca_out = self.attn2(self.norm2(x), text_states, high_token_mode=high_token_mode)
+        x.add_(ca_out)
 
         # FFN Layer
         mlp_inputs = self.norm3(x)
 
         if self.use_moe:
-            x = x + self.moe(mlp_inputs)
+            ffn_out = self.moe(mlp_inputs, high_token_mode=high_token_mode, moe_offload=moe_offload)
         else:
-            x = x + self.mlp(mlp_inputs)
+            ffn_out = self.mlp(mlp_inputs)
+        
+        x.add_(ffn_out)
 
         return x
 
@@ -604,7 +654,7 @@ class RefineDiT(nn.Module):
 
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
 
-    def forward(self, x, t, contexts, **kwargs):
+    def forward(self, x, t, contexts, high_token_mode=False, moe_offload=False, **kwargs):
         cond = contexts['main']
 
         t = self.t_embedder(t, condition=kwargs.get('guidance_cond'))
@@ -626,6 +676,12 @@ class RefineDiT(nn.Module):
 
         rotary_cos = torch.cat([cond_cos, rotary_cos_vox], dim=1)
         rotary_sin = torch.cat([cond_sin, rotary_sin_vox], dim=1)
+        
+        # Defensive slicing to handle sequence length mismatches between x and voxel_cond
+        target_len = x.shape[1] + num_cond_tokens
+        if rotary_cos.shape[1] > target_len:
+            rotary_cos = rotary_cos[:, :target_len, :]
+            rotary_sin = rotary_sin[:, :target_len, :]
         ##########################################
 
         x = torch.cat([c, x], dim=1)
@@ -633,9 +689,13 @@ class RefineDiT(nn.Module):
         skip_value_list = []
         for layer, block in enumerate(self.blocks):
             skip_value = None if layer <= self.depth // 2 else skip_value_list.pop()
-            x = block(x, c, cond, rotary_cos=rotary_cos, rotary_sin=rotary_sin, skip_value=skip_value)
+            x = block(x, c, cond, rotary_cos=rotary_cos, rotary_sin=rotary_sin, 
+                      skip_value=skip_value, high_token_mode=high_token_mode, moe_offload=moe_offload)
             if layer < self.depth // 2:
-                skip_value_list.append(x)
+                if high_token_mode:
+                    skip_value_list.append(x.to("cpu"))
+                else:
+                    skip_value_list.append(x)
 
         x = self.final_layer(x)
         return x

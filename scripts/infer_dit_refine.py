@@ -153,6 +153,10 @@ def run_inference(args):
         image_processor=components['image_processor']
     )
 
+    if args.compile:
+        print("Compiling models...")
+        pipeline.compile()
+
     if args.low_vram:
         print("Enabling official model CPU offloading...")
         pipeline.enable_model_cpu_offload()
@@ -192,6 +196,9 @@ def run_inference(args):
             octree_resolution=args.octree_res,
             num_inference_steps=args.steps,
             num_chunks=args.chunk_size,
+            high_token_mode=args.high_token_mode,
+            moe_offload=args.moe_offload,
+            sequential_cfg=args.seq_cfg,
         )
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -223,6 +230,11 @@ if __name__ == "__main__":
     parser.add_argument("--octree_res", type=int, default=1024, help="Marching Cubes resolution")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--remove_bg", action="store_true", help="Force remove background")
+    
+    parser.add_argument("--high_token_mode", action="store_true", help="Enable optimizations for 16k+ tokens")
+    parser.add_argument("--moe_offload", action="store_true", help="Offload MoE experts to CPU sequentially")
+    parser.add_argument("--seq_cfg", action="store_true", help="Process CFG passes sequentially to save memory")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile for models")
 
     args = parser.parse_args()
     

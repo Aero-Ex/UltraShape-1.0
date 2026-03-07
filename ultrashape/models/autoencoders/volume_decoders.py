@@ -37,57 +37,42 @@ def extract_near_surface_volume_fn(input_tensor: torch.Tensor, alpha: float):
     val = input_tensor + alpha
     valid_mask = val > -9000
 
-    mask = torch.ones_like(val, dtype=torch.int32)
-    sign = torch.sign(val.to(torch.float32))
+    # sign = torch.sign(val.to(torch.float32))
+    # sign = (val > 0) #boolean sign for zero-memory overhead
+    sign = val > 0
+    mask = torch.ones_like(val, dtype=torch.bool)
 
-    # Helper to compute neighbor for a single direction
-    def check_neighbor_sign(shift, axis):
-        if shift == 0:
-            return
+    # Pad once for all directions
+    padded = F.pad(val.unsqueeze(0).unsqueeze(0), [1, 1, 1, 1, 1, 1], mode='replicate').squeeze(0).squeeze(0)
 
-        pad_dims = [0, 0, 0, 0, 0, 0]
-        if axis == 0:
-            pad_idx = 0 if shift > 0 else 1
-            pad_dims[pad_idx] = abs(shift)
-        elif axis == 1:
-            pad_idx = 2 if shift > 0 else 3
-            pad_dims[pad_idx] = abs(shift)
-        elif axis == 2:
-            pad_idx = 4 if shift > 0 else 5
-            pad_dims[pad_idx] = abs(shift)
-
-        padded = F.pad(val.unsqueeze(0).unsqueeze(0), pad_dims[::-1], mode='replicate')
-
-        slice_dims = [slice(None)] * 3
-        if axis == 0:
-            if shift > 0: slice_dims[0] = slice(shift, None)
-            else: slice_dims[0] = slice(None, shift)
-        elif axis == 1:
-            if shift > 0: slice_dims[1] = slice(shift, None)
-            else: slice_dims[1] = slice(None, shift)
-        elif axis == 2:
-            if shift > 0: slice_dims[2] = slice(shift, None)
-            else: slice_dims[2] = slice(None, shift)
-
-        padded = padded.squeeze(0).squeeze(0)
-        neighbor = padded[slice_dims]
-        neighbor = torch.where(neighbor > -9000, neighbor, val)
-
-        # Check sign consistency
-        neighbor_sign = torch.sign(neighbor.to(torch.float32))
-        return (neighbor_sign == sign)
-
-    # Iteratively check neighbors and update mask
     # directions: (shift, axis)
     directions = [(1, 0), (-1, 0), (1, 1), (-1, 1), (1, 2), (-1, 2)]
 
     for shift, axis in directions:
-        is_same = check_neighbor_sign(shift, axis)
-        mask = mask & is_same.to(torch.int32)
+        slice_dims = [slice(1, -1)] * 3
+        if axis == 0:
+            if shift > 0: slice_dims[0] = slice(2, None)
+            else: slice_dims[0] = slice(None, -2)
+        elif axis == 1:
+            if shift > 0: slice_dims[1] = slice(2, None)
+            else: slice_dims[1] = slice(None, -2)
+        elif axis == 2:
+            if shift > 0: slice_dims[2] = slice(2, None)
+            else: slice_dims[2] = slice(None, -2)
+
+        neighbor = padded[tuple(slice_dims)]
+        # neighbor = torch.where(neighbor > -9000, neighbor, val)
+        # Sign check on boolean masks is just XOR/XNOR or equality
+        neighbor_sign = neighbor > 0
+        
+        # If neighbor is invalid (-9000), treat it as having the same sign to ignore it
+        invalid_neighbor = neighbor <= -9000
+        is_same = (neighbor_sign == sign) | invalid_neighbor
+        
+        mask &= is_same
 
     # Invert mask: we want 1 where ANY neighbor has different sign
-    mask = (~(mask.bool())).to(torch.int32)
-    return mask * valid_mask.to(torch.int32)
+    return (~mask & valid_mask).to(torch.int32)
 
 
 def generate_dense_grid_points(
@@ -195,9 +180,6 @@ class HierarchicalVolumeDecoding:
             indexing="ij"
         )
 
-        dilate = nn.Conv3d(1, 1, 3, padding=1, bias=False, device=device, dtype=dtype)
-        dilate.weight = torch.nn.Parameter(torch.ones(dilate.weight.shape, dtype=dtype, device=device))
-
         grid_size = np.array(grid_size)
         xyz_samples = torch.from_numpy(xyz_samples).to(device, dtype=dtype).contiguous().reshape(-1, 3)
 
@@ -218,48 +200,75 @@ class HierarchicalVolumeDecoding:
         for octree_depth_now in resolutions[1:]:
             grid_size = np.array([octree_depth_now + 1] * 3)
             resolution = bbox_size / octree_depth_now
-            next_index = torch.zeros(tuple(grid_size), dtype=dtype, device=device)
-            next_logits = torch.full(next_index.shape, -10000., dtype=dtype, device=device)
-            curr_points = extract_near_surface_volume_fn(grid_logits.squeeze(0), mc_level)
-            curr_points += grid_logits.squeeze(0).abs() < 0.95
+            
+            # 1. Surface extraction at CURRENT (lower) resolution
+            curr_points = extract_near_surface_volume_fn(grid_logits.squeeze(0), mc_level).bool()
+            curr_points |= grid_logits.squeeze(0).abs() < 0.95
+            
+            # 2. Aggressive cleanup of the previous resolution's logits if not the final step
+            # Actually we need grid_logits for the next resolution's queries if it's not FlashVDM 
+            # But in HierarchicalVolumeDecoding, the queries don't depend on previous logits values, 
+            # only on the mask. So we can clear grid_logits now.
+            del grid_logits
+            torch.cuda.empty_cache()
 
-            if octree_depth_now == resolutions[-1]:
-                expand_num = 0
-            else:
-                expand_num = 1
-            for i in range(expand_num):
-                curr_points = dilate(curr_points.unsqueeze(0).to(dtype)).squeeze(0)
-            (cidx_x, cidx_y, cidx_z) = torch.where(curr_points > 0)
-            next_index[cidx_x * 2, cidx_y * 2, cidx_z * 2] = 1
-            for i in range(2 - expand_num):
-                next_index = dilate(next_index.unsqueeze(0)).squeeze(0)
-            nidx = torch.where(next_index > 0)
-
-            # Store shape before deleting
-            next_index_shape = next_index.shape
-            del next_index
+            # 3. Dilate at LOWER resolution (very light)
+            # Dilating once at res N is enough to cover children at res 2N
+            curr_points = F.max_pool3d(curr_points.unsqueeze(0).unsqueeze(0).to(dtype), kernel_size=3, stride=1, padding=1).squeeze(0).squeeze(0)
+            
+            # 4. Sparse Index Expansion (Avoids dense $1000^3$ mask OOM)
+            log_vram(f"Dec: Sparse Index Expansion (Hier Res: {octree_depth_now})")
+            cidx = torch.where(curr_points > 0)
+            del curr_points
+            
+            # Generate 8 children for each point at resolution N
+            x, y, z = cidx
+            offsets = torch.tensor([
+                [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+                [1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1]
+            ], device=device, dtype=torch.long)
+            base_idx = torch.stack([x.long(), y.long(), z.long()], dim=1) * 2
+            expanded = base_idx.unsqueeze(1) + offsets.unsqueeze(0)
+            expanded = expanded.view(-1, 3)
+            
+            # Filter bounds
+            valid_mask = (expanded[:, 0] < grid_size[0]) & (expanded[:, 1] < grid_size[1]) & (expanded[:, 2] < grid_size[2])
+            expanded = expanded[valid_mask]
+            nidx = (expanded[:, 0], expanded[:, 1], expanded[:, 2])
+            
+            next_index_shape = tuple(grid_size)
+            del expanded
+            del base_idx
+            del cidx
             torch.cuda.empty_cache()
 
             next_points = torch.stack(nidx, dim=1)
-            next_points = (next_points * torch.tensor(resolution, dtype=next_points.dtype, device=device) +
-                           torch.tensor(bbox_min, dtype=next_points.dtype, device=device))
+            next_points = (next_points * torch.tensor(resolution, dtype=torch.float32, device=device) +
+                           torch.tensor(bbox_min, dtype=torch.float32, device=device))
+            
             batch_logits = []
             for start in tqdm(range(0, next_points.shape[0], num_chunks),
                               desc=f"Hierarchical Volume Decoding [r{octree_depth_now + 1}]"):
                 queries = next_points[start: start + num_chunks, :]
                 batch_queries = repeat(queries, "p c -> b p c", b=batch_size)
-                log_vram("Dec: Before Geo Query (Hier Loop)")
                 logits = geo_decoder(queries=batch_queries.to(latents.dtype), latents=latents)
-                log_vram("Dec: After Geo Query (Hier Loop)")
                 batch_logits.append(logits)
 
-            # Delayed allocation of next_logits
+            # 5. Populate the NEXT dense grid
             next_logits = torch.full(next_index_shape, -10000., dtype=dtype, device=device)
-            grid_logits = torch.cat(batch_logits, dim=1)
-            next_logits[nidx] = grid_logits[0, ..., 0]
+            grid_logits_sparse = torch.cat(batch_logits, dim=1)
+            next_logits[nidx] = grid_logits_sparse[0, ..., 0]
+            
             grid_logits = next_logits.unsqueeze(0)
-        grid_logits[grid_logits == -10000.] = float('nan')
+            del next_logits
+            del grid_logits_sparse
+            del batch_logits
+            torch.cuda.empty_cache()
 
+        # Final NaN conversion: Chunked to avoid 1GB boolean mask spike on 1024^3 grids
+        for i in range(grid_logits.shape[1]):
+            layer = grid_logits[:, i]
+            layer[layer == -10000.] = float('nan')
         return grid_logits
 
 
@@ -321,9 +330,6 @@ class FlashVDMVolumeDecoding:
             indexing="ij"
         )
 
-        dilate = nn.Conv3d(1, 1, 3, padding=1, bias=False, device=device, dtype=dtype)
-        dilate.weight = torch.nn.Parameter(torch.ones(dilate.weight.shape, dtype=dtype, device=device))
-
         grid_size = np.array(grid_size)
 
         # 2. latents to 3d volume
@@ -375,34 +381,46 @@ class FlashVDMVolumeDecoding:
         for octree_depth_now in resolutions[1:]:
             grid_size = np.array([octree_depth_now + 1] * 3)
             resolution = bbox_size / octree_depth_now
-            next_index = torch.zeros(tuple(grid_size), dtype=dtype, device=device)
-            curr_points = extract_near_surface_volume_fn(grid_logits.squeeze(0), mc_level)
-            curr_points += grid_logits.squeeze(0).abs() < 0.95
+            
+            # 1. Surface extraction at CURRENT (lower) resolution
+            curr_points = extract_near_surface_volume_fn(grid_logits.squeeze(0), mc_level).bool()
+            curr_points |= grid_logits.squeeze(0).abs() < 0.95
+            
+            # 2. Cleanup previous resolution logits (we only need the binary mask for next steps)
+            del grid_logits
+            torch.cuda.empty_cache()
 
-            if octree_depth_now == resolutions[-1]:
-                expand_num = 0
-            else:
-                expand_num = 1
-            for i in range(expand_num):
-                curr_points = dilate(curr_points.unsqueeze(0).to(dtype)).squeeze(0)
-                curr_points = dilate(curr_points.unsqueeze(0).to(dtype)).squeeze(0)
-            (cidx_x, cidx_y, cidx_z) = torch.where(curr_points > 0)
-
-            next_index[cidx_x * 2, cidx_y * 2, cidx_z * 2] = 1
-            for i in range(2 - expand_num):
-                next_index = dilate(next_index.unsqueeze(0)).squeeze(0)
-            nidx = torch.where(next_index > 0)
-
-            # Store shape before deleting
-            next_index_shape = next_index.shape
-            del next_index
+            # 3. Dilate at LOWER resolution (very light)
+            # Dilating once at low res is enough to cover children and their immediate neighbors at high res
+            curr_points = F.max_pool3d(curr_points.unsqueeze(0).unsqueeze(0).to(dtype), kernel_size=3, stride=1, padding=1).squeeze(0).squeeze(0)
+            
+            # 4. Sparse Index Expansion (Avoids dense $1000^3$ mask OOM)
+            log_vram(f"FlashVDM: Sparse Index Expansion (Hier Res: {octree_depth_now})")
+            cidx = torch.where(curr_points > 0)
+            del curr_points
+            
+            # Generate 8 children for each point at resolution N
+            x, y, z = cidx
+            offsets = torch.tensor([
+                [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+                [1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1]
+            ], device=device, dtype=torch.long)
+            base_idx = torch.stack([x.long(), y.long(), z.long()], dim=1) * 2
+            expanded = base_idx.unsqueeze(1) + offsets.unsqueeze(0)
+            expanded = expanded.view(-1, 3)
+            
+            # Filter bounds
+            valid_mask = (expanded[:, 0] < grid_size[0]) & (expanded[:, 1] < grid_size[1]) & (expanded[:, 2] < grid_size[2])
+            expanded = expanded[valid_mask]
+            nidx = (expanded[:, 0], expanded[:, 1], expanded[:, 2])
+            
+            next_index_shape = tuple(grid_size)
+            del expanded
+            del base_idx
+            del cidx
             torch.cuda.empty_cache()
 
             next_points = torch.stack(nidx, dim=1)
-            if next_points.shape[0] == 0:
-                logger.warning(f"No points found at resolution {octree_depth_now}. Terminating hierarchical decoding.")
-                break
-
             next_points = (next_points * torch.tensor(resolution, dtype=torch.float32, device=device) +
                            torch.tensor(bbox_min, dtype=torch.float32, device=device))
 
@@ -415,7 +433,7 @@ class FlashVDMVolumeDecoding:
             index = index.sort()
             next_points = next_points[index.indices].unsqueeze(0).contiguous()
             unique_values = torch.unique(index.values, return_counts=True)
-            grid_logits = torch.zeros((next_points.shape[1]), dtype=latents.dtype, device=latents.device)
+            grid_logits_sparse = torch.zeros((next_points.shape[1]), dtype=latents.dtype, device=latents.device)
             input_grid = [[], []]
             logits_grid_list = []
             start_num = 0
@@ -433,7 +451,6 @@ class FlashVDMVolumeDecoding:
                         input_grid = [[], []]
                         sum_num = 0
                         space_left = num_chunks
-
                     take = min(remaining_count, space_left)
                     input_grid[0].append(grid_index)
                     input_grid[1].append(take)
@@ -445,14 +462,24 @@ class FlashVDMVolumeDecoding:
                 logits_grid = geo_decoder(queries=next_points[:, start_num:start_num + sum_num], latents=latents)
                 log_vram("FlashVDM: After Geo Query")
                 logits_grid_list.append(logits_grid)
+            
             logits_grid = torch.cat(logits_grid_list, dim=1)
-            grid_logits[index.indices] = logits_grid.squeeze(0).squeeze(-1)
+            grid_logits_sparse[index.indices] = logits_grid.squeeze(0).squeeze(-1)
+            del logits_grid_list
+            del logits_grid
+            torch.cuda.empty_cache()
 
-            # Delayed allocation of next_logits
+            # 5. Populate NEXT dense grid
             next_logits = torch.full(next_index_shape, -10000., dtype=dtype, device=device)
-            next_logits[nidx] = grid_logits
+            next_logits[nidx] = grid_logits_sparse
             grid_logits = next_logits.unsqueeze(0)
+            
+            del next_logits
+            del grid_logits_sparse
+            torch.cuda.empty_cache()
 
-        grid_logits[grid_logits == -10000.] = float('nan')
-
+        # Final NaN conversion: Chunked to avoid 1GB boolean mask spike on 1024^3 grids
+        for i in range(grid_logits.shape[1]):
+            layer = grid_logits[:, i]
+            layer[layer == -10000.] = float('nan')
         return grid_logits

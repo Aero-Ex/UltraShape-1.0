@@ -213,16 +213,41 @@ class MCSurfaceExtractor(SurfaceExtractor):
         """
 
         grid_logit = grid_logit.detach()
-
         sparse_coords, sparse_logits = get_sparse_valid_voxels(grid_logit)
-        # Convert to float32 only for the sparse set
-        vertices, faces = cubvh.sparse_marching_cubes(sparse_coords, sparse_logits.float(), mc_level)
+        
+        if sparse_coords.shape[0] == 0:
+            return np.empty((0, 3)), np.empty((0, 3), dtype=np.int32)
 
-        vertices, faces = vertices.cpu().numpy(), faces.cpu().numpy()
+        # Chunked processing to avoid cubvh workspace OOM on 6GB GPUs
+        chunk_size = 1000000 
+        all_vertices = []
+        all_faces = []
+        vert_count = 0
+        
+        for start in range(0, sparse_coords.shape[0], chunk_size):
+            end = min(start + chunk_size, sparse_coords.shape[0])
+            c_coords = sparse_coords[start:end]
+            c_logits = sparse_logits[start:end]
+            
+            v, f = cubvh.sparse_marching_cubes(c_coords, c_logits.float(), mc_level)
+            
+            if v.shape[0] > 0:
+                all_vertices.append(v.cpu().numpy())
+                all_faces.append(f.cpu().numpy() + vert_count)
+                vert_count += v.shape[0]
+            
+            del v, f, c_coords, c_logits
+            torch.cuda.empty_cache()
+
+        if not all_vertices:
+            return np.empty((0, 3)), np.empty((0, 3), dtype=np.int32)
+
+        vertices = np.concatenate(all_vertices, axis=0)
+        faces = np.concatenate(all_faces, axis=0)
         # vertices, faces, normals, _ = measure.marching_cubes(grid_logit,
         #             mc_level, method="lewiner", mask=(~np.isnan(grid_logit)))
         grid_size, bbox_min, bbox_size = self._compute_box_stat(bounds, octree_resolution)
-        vertices = vertices / grid_size * bbox_size + bbox_min
+        vertices = vertices / (np.array(grid_size) - 1) * bbox_size + bbox_min
         return vertices, faces
 
 

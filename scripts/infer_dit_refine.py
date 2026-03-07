@@ -52,17 +52,37 @@ def load_models(config_path, ckpt_path, device='cuda', args=None):
     
     weights = None
     if ckpt_path and os.path.exists(ckpt_path):
-        print(f"Loading weights from {ckpt_path} to CPU (mmap=True)...")
-        try:
-            # Use mmap=True to avoid loading everything into RAM at once
-            weights = torch.load(ckpt_path, map_location='cpu', mmap=True, weights_only=True)
-        except Exception as e:
-            print(f"Standard mmap load failed ({e}), trying without weights_only...")
+        if ckpt_path.endswith('.safetensors'):
+            print(f"Loading weights from {ckpt_path} using safetensors...")
+            import safetensors.torch
+            weights_flat = safetensors.torch.load_file(ckpt_path, device='cpu')
+            
+            # Check if it's a flat dict with prefixes (vae., dit., etc.)
+            has_prefixes = any('.' in k for k in weights_flat.keys())
+            if has_prefixes:
+                weights = {}
+                for key, value in weights_flat.items():
+                    parts = key.split('.')
+                    model_name = parts[0]
+                    new_key = ".".join(parts[1:])
+                    if model_name not in weights:
+                        weights[model_name] = {}
+                    weights[model_name][new_key] = value
+            else:
+                weights = weights_flat
+            del weights_flat
+        else:
+            print(f"Loading weights from {ckpt_path} to CPU (mmap=True)...")
             try:
-                weights = torch.load(ckpt_path, map_location='cpu', mmap=True)
-            except Exception as e2:
-                print(f"mmap load failed ({e2}), falling back to direct load...")
-                weights = torch.load(ckpt_path, map_location='cpu')
+                # Use mmap=True to avoid loading everything into RAM at once
+                weights = torch.load(ckpt_path, map_location='cpu', mmap=True, weights_only=True)
+            except Exception as e:
+                print(f"Standard mmap load failed ({e}), trying without weights_only...")
+                try:
+                    weights = torch.load(ckpt_path, map_location='cpu', mmap=True)
+                except Exception as e2:
+                    print(f"mmap load failed ({e2}), falling back to direct load...")
+                    weights = torch.load(ckpt_path, map_location='cpu')
 
     def cleanup():
         gc.collect()

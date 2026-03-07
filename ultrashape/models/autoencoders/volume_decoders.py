@@ -19,6 +19,7 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
+import time
 from typing import Union, Tuple, List, Callable
 
 import numpy as np
@@ -359,15 +360,11 @@ class FlashVDMVolumeDecoding:
                 batch_logits_sub = []
                 for sub_start in range(0, queries.shape[1], num_chunks):
                     sub_queries = queries[:, sub_start: sub_start + num_chunks, :]
-                    log_vram("Dec: Before Geo Query")
                     logits = geo_decoder(queries=sub_queries, latents=batch_latents)
-                    log_vram("Dec: After Geo Query")
                     batch_logits_sub.append(logits)
                 logits = torch.cat(batch_logits_sub, dim=1)
             else:
-                log_vram("Dec: Before Geo Query")
                 logits = geo_decoder(queries=queries, latents=batch_latents)
-                log_vram("Dec: After Geo Query")
 
             batch_logits.append(logits)
         grid_logits = torch.cat(batch_logits, dim=0).reshape(
@@ -396,6 +393,7 @@ class FlashVDMVolumeDecoding:
             
             # 4. Sparse Index Expansion (Avoids dense $1000^3$ mask OOM)
             log_vram(f"FlashVDM: Sparse Index Expansion (Hier Res: {octree_depth_now})")
+            t_expand_start = time.time()
             cidx = torch.where(curr_points > 0)
             del curr_points
             
@@ -420,6 +418,9 @@ class FlashVDMVolumeDecoding:
             del cidx
             torch.cuda.empty_cache()
 
+            t_expand = time.time() - t_expand_start
+            log_vram(f"FlashVDM: Point Generation (Res: {octree_depth_now}) | Takes: {t_expand:.2f}s")
+            t_prep_start = time.time()
             next_points = torch.stack(nidx, dim=1)
             next_points = (next_points * torch.tensor(resolution, dtype=torch.float32, device=device) +
                            torch.tensor(bbox_min, dtype=torch.float32, device=device))
@@ -432,12 +433,16 @@ class FlashVDMVolumeDecoding:
             index = index[..., 0] * (query_grid_num ** 2) + index[..., 1] * query_grid_num + index[..., 2]
             index = index.sort()
             next_points = next_points[index.indices].unsqueeze(0).contiguous()
+
+            t_prep = time.time() - t_prep_start
+            log_vram(f"FlashVDM: Points Prepared ({next_points.shape[1]} pts) | Takes: {t_prep:.2f}s")
             unique_values = torch.unique(index.values, return_counts=True)
             grid_logits_sparse = torch.zeros((next_points.shape[1]), dtype=latents.dtype, device=latents.device)
             input_grid = [[], []]
             logits_grid_list = []
             start_num = 0
             sum_num = 0
+            t_decode_start = time.time()
             for grid_index, count in zip(unique_values[0].cpu().tolist(), unique_values[1].cpu().tolist()):
                 remaining_count = count
                 while remaining_count > 0:
@@ -458,10 +463,12 @@ class FlashVDMVolumeDecoding:
                     remaining_count -= take
             if sum_num > 0:
                 processor.topk = input_grid
-                log_vram(f"FlashVDM: Geo Query (Hier Res: {octree_depth_now})")
+                log_vram(f"FlashVDM: Final Geo Query (Res: {octree_depth_now})")
                 logits_grid = geo_decoder(queries=next_points[:, start_num:start_num + sum_num], latents=latents)
-                log_vram("FlashVDM: After Geo Query")
                 logits_grid_list.append(logits_grid)
+            
+            t_decode = time.time() - t_decode_start
+            log_vram(f"FlashVDM: Decoding Done (Res: {octree_depth_now}) | Takes: {t_decode:.2f}s")
             
             logits_grid = torch.cat(logits_grid_list, dim=1)
             grid_logits_sparse[index.indices] = logits_grid.squeeze(0).squeeze(-1)
